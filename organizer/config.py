@@ -2,13 +2,16 @@
 config.py — Central configuration for file-type to folder mapping.
 
 Uses only standard library. All extensions are stored lowercase with leading dot.
+Universal Fallback: ANY unrecognized extension or file with no extension
+is automatically routed to FALLBACK_CATEGORY ("Miscellaneous").
 """
 
 from pathlib import Path
 
 # Primary mapping: extension -> category folder name
+# Robust coverage across 6+ standard groups as required.
 EXTENSION_MAP: dict[str, str] = {
-    # Documents
+    # --- Documents ---
     ".pdf": "Documents",
     ".doc": "Documents",
     ".docx": "Documents",
@@ -23,8 +26,11 @@ EXTENSION_MAP: dict[str, str] = {
     ".md": "Documents",
     ".tex": "Documents",
     ".epub": "Documents",
+    ".pages": "Documents",
+    ".numbers": "Documents",
+    ".key": "Documents",
 
-    # Images
+    # --- Images ---
     ".jpg": "Images",
     ".jpeg": "Images",
     ".png": "Images",
@@ -39,8 +45,11 @@ EXTENSION_MAP: dict[str, str] = {
     ".raw": "Images",
     ".psd": "Images",
     ".ai": "Images",
+    ".eps": "Images",
+    ".cr2": "Images",
+    ".nef": "Images",
 
-    # Videos
+    # --- Videos ---
     ".mp4": "Videos",
     ".mkv": "Videos",
     ".avi": "Videos",
@@ -52,8 +61,10 @@ EXTENSION_MAP: dict[str, str] = {
     ".mpg": "Videos",
     ".mpeg": "Videos",
     ".3gp": "Videos",
+    ".mts": "Videos",
+    ".m2ts": "Videos",
 
-    # Audio
+    # --- Audio ---
     ".mp3": "Audio",
     ".wav": "Audio",
     ".flac": "Audio",
@@ -63,8 +74,11 @@ EXTENSION_MAP: dict[str, str] = {
     ".m4a": "Audio",
     ".aiff": "Audio",
     ".opus": "Audio",
+    ".alac": "Audio",
+    ".mid": "Audio",
+    ".midi": "Audio",
 
-    # Archives
+    # --- Archives ---
     ".zip": "Archives",
     ".rar": "Archives",
     ".tar": "Archives",
@@ -75,20 +89,26 @@ EXTENSION_MAP: dict[str, str] = {
     ".iso": "Archives",
     ".dmg": "Archives",
     ".pkg": "Archives",
+    ".zst": "Archives",
+    ".lz4": "Archives",
 
-    # Executables / Installers
+    # --- Executables / Installers ---
     ".exe": "Executables",
     ".msi": "Executables",
-    ".sh": "Executables",
     ".bat": "Executables",
     ".appimage": "Executables",
     ".apk": "Executables",
     ".deb": "Executables",
+    ".rpm": "Executables",
+    ".run": "Executables",
+    ".bin": "Executables",
 
-    # Code
+    # --- Code ---
     ".py": "Code",
     ".js": "Code",
     ".ts": "Code",
+    ".jsx": "Code",
+    ".tsx": "Code",
     ".java": "Code",
     ".c": "Code",
     ".cpp": "Code",
@@ -101,38 +121,49 @@ EXTENSION_MAP: dict[str, str] = {
     ".php": "Code",
     ".swift": "Code",
     ".kt": "Code",
+    ".kts": "Code",
     ".html": "Code",
     ".htm": "Code",
     ".css": "Code",
+    ".scss": "Code",
     ".json": "Code",
     ".xml": "Code",
     ".yaml": "Code",
     ".yml": "Code",
     ".toml": "Code",
+    ".ini": "Code",
+    ".cfg": "Code",
     ".sql": "Code",
     ".sh": "Code",
+    ".bash": "Code",
+    ".zsh": "Code",
     ".ipynb": "Code",
-
-    # Spreadsheets (also Documents but explicit override is not needed)
-    # Designated as Documents already; kept for clarity no duplication.
-
-    # Fonts
-    ".ttf": "Fonts",
-    ".otf": "Fonts",
-    ".woff": "Fonts",
-    ".woff2": "Fonts",
+    ".r": "Code",
+    ".dart": "Code",
+    ".lua": "Code",
+    ".pl": "Code",
 }
 
 # Fallback category for unknown extensions or files without extension
+# This is the Universal Fallback — guarantees EVERY file is sortable.
+# Accepted aliases in spec: "Others" or "Miscellaneous" — we use "Miscellaneous"
+# and expose "Others" as an alias for compatibility.
 FALLBACK_CATEGORY = "Miscellaneous"
+OTHERS_ALIAS = "Others"  # alias, not used as folder but recognized if present
 
 # Derived set of all target folder names (for skipping during scan)
 CATEGORY_FOLDERS: set[str] = set(EXTENSION_MAP.values()) | {FALLBACK_CATEGORY}
+
+# History file name for undo engine
+HISTORY_FILENAME = ".organizer_history.json"
 
 
 def get_category(extension: str) -> str:
     """
     Return the category folder for a given file extension.
+
+    Universal Fallback: returns FALLBACK_CATEGORY for any unrecognized
+    extension or empty string (no extension).
 
     Args:
         extension: File extension including leading dot (e.g. '.pdf').
@@ -143,9 +174,18 @@ def get_category(extension: str) -> str:
     """
     if not extension:
         return FALLBACK_CATEGORY
-    return EXTENSION_MAP.get(extension.lower(), FALLBACK_CATEGORY)
+    # Normalize: ensure leading dot, lowercase
+    ext = extension.lower()
+    if not ext.startswith("."):
+        ext = f".{ext}"
+    return EXTENSION_MAP.get(ext, FALLBACK_CATEGORY)
 
 
 def get_category_for_path(file_path: Path) -> str:
-    """Convenience wrapper that extracts suffix from a Path object."""
+    """
+    Convenience wrapper that extracts suffix from a Path object.
+
+    Handles files with no suffix or unknown suffix via universal fallback.
+    Uses Path.suffix which returns '' for no extension.
+    """
     return get_category(file_path.suffix)
