@@ -1,0 +1,12 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment & OS
+.venv/
+env/
+.DS_Store
+
+# Local test sandboxes
+test_dir/
