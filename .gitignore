@@ -10,3 +10,6 @@ env/
 
 # Local test sandboxes
 test_dir/
+dist/
+build/
+*.spec
