@@ -189,3 +189,159 @@ def get_category_for_path(file_path: Path) -> str:
     Uses Path.suffix which returns '' for no extension.
     """
     return get_category(file_path.suffix)
+
+
+# ------------------------------------------------------------------ #
+# Custom Configuration Helpers
+# ------------------------------------------------------------------ #
+
+def get_default_config_dict() -> dict[str, list[str]]:
+    """
+    Invert EXTENSION_MAP to produce category -> [extensions] mapping.
+
+    Used for --generate-config to emit a template JSON that users can edit.
+    Extensions are sorted for deterministic output.
+    """
+    from collections import defaultdict
+
+    inverted: dict[str, list[str]] = defaultdict(list)
+    for ext, cat in EXTENSION_MAP.items():
+        inverted[cat].append(ext)
+    # Sort extensions and categories for stable output
+    return {cat: sorted(exts) for cat, exts in sorted(inverted.items())}
+
+
+def sanitize_extension(raw_ext: str) -> tuple[str | None, bool]:
+    """
+    Sanitize a single extension string.
+
+    - Strips whitespace
+    - Lowercases
+    - Adds leading dot if missing (e.g., "mp4" -> ".mp4")
+    - Validates non-empty after sanitization
+
+    Returns:
+        (sanitized_ext_or_None, was_sanitized) — sanitized flag True if dot was auto-added
+        or case was normalized; None if invalid/empty and should be skipped.
+    """
+    if not isinstance(raw_ext, str):
+        return None, False
+    ext = raw_ext.strip().lower()
+    if not ext:
+        return None, False
+    was_sanitized = False
+    if not ext.startswith("."):
+        ext = f".{ext}"
+        was_sanitized = True
+    elif raw_ext != ext:
+        # case normalization or whitespace already handled
+        was_sanitized = raw_ext.strip() != ext or raw_ext.lower() != raw_ext
+    # Basic validation: after dot should have at least one alphanum char
+    if len(ext) < 2 or ext == ".":
+        return None, False
+    return ext, was_sanitized
+
+
+def load_custom_config(path: Path | str) -> tuple[dict[str, str], set[str]]:
+    """
+    Load and sanitize a user-provided JSON config file.
+
+    Expected JSON format:
+        {
+            "CategoryA": [".ext1", ".ext2"],
+            "Category B": ["mp4", ".mkv"]   # dot auto-added if missing
+        }
+
+    Completely overrides the default EXTENSION_MAP when used.
+
+    Args:
+        path: Path to .json file.
+
+    Returns:
+        (extension_map, category_folders) — extension_map is ext->category,
+        category_folders is set of category names.
+
+    Raises:
+        FileNotFoundError, ValueError, OSError with helpful messages.
+    """
+    import json
+
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {p}")
+    if not p.is_file():
+        raise ValueError(f"Config path is not a file: {p}")
+
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in config file {p}: {exc}") from exc
+    except OSError as exc:
+        raise OSError(f"Cannot read config file {p}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Config JSON must be an object mapping category -> [extensions], got {type(data).__name__}")
+
+    if not data:
+        raise ValueError(f"Config JSON is empty: {p}")
+
+    extension_map: dict[str, str] = {}
+    category_folders: set[str] = set()
+    warnings: list[str] = []
+
+    for category, exts in data.items():
+        if not isinstance(category, str) or not category.strip():
+            warnings.append(f"Skipping invalid category name: {category!r}")
+            continue
+        cat = category.strip()
+        # Keep original casing for folder name, but strip whitespace
+        if not isinstance(exts, (list, tuple)):
+            raise ValueError(f"Category {cat!r} must map to a list of extensions, got {type(exts).__name__}")
+
+        if not exts:
+            warnings.append(f"Category {cat!r} has no extensions — will be ignored")
+            continue
+
+        category_folders.add(cat)
+        for raw_ext in exts:
+            sanitized, was_sanitized = sanitize_extension(raw_ext) if isinstance(raw_ext, str) else (None, False)
+            if sanitized is None:
+                warnings.append(f"Skipping invalid extension {raw_ext!r} in category {cat!r}")
+                continue
+            if was_sanitized:
+                warnings.append(f"Sanitized {raw_ext!r} -> {sanitized!r} in category {cat!r}")
+            # Deduplicate: last category wins if same extension appears twice
+            if sanitized in extension_map and extension_map[sanitized] != cat:
+                warnings.append(f"Extension {sanitized!r} remapped from {extension_map[sanitized]!r} to {cat!r}")
+            extension_map[sanitized] = cat
+
+    if not extension_map:
+        raise ValueError(f"No valid extensions found in config file {p}")
+
+    # Caller can inspect warnings via returned data; we also expose them via attribute
+    # For now return; detailed warnings are printed by the caller with colors
+    # Attach warnings for introspection if needed
+    load_custom_config.warnings = warnings  # type: ignore
+    return extension_map, category_folders
+
+
+def generate_template_config(destination: Path | str = "organizer_config.json") -> Path:
+    """
+    Create a template organizer_config.json in the given location.
+
+    Writes the default inverted mapping (category -> [exts]) as pretty JSON.
+
+    Returns:
+        Path to created file.
+    """
+    import json
+
+    dest = Path(destination)
+    template = get_default_config_dict()
+    # Ensure parent exists
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(template, f, indent=2, sort_keys=True)
+        f.write("\n")
+    return dest

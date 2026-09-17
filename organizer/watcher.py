@@ -93,7 +93,12 @@ class OrganizerHandler(FileSystemEventHandler):  # type: ignore
             pass  # already logged inside organize_single_file
 
 
-def start_watch(source: Path | str, destination: Path | str | None = None, verbose: bool = False) -> None:
+def start_watch(
+    source: Path | str,
+    destination: Path | str | None = None,
+    verbose: bool = False,
+    config_path: Path | str | None = None,
+) -> None:
     """
     Start the watchdog daemon. Blocks until Ctrl+C.
 
@@ -101,6 +106,7 @@ def start_watch(source: Path | str, destination: Path | str | None = None, verbo
         source: Directory to watch.
         destination: Where to organize into (defaults to source).
         verbose: Enable debug logging.
+        config_path: Optional path to custom JSON config (overrides defaults).
     """
     if not WATCHDOG_AVAILABLE:
         print(f"{RED}Error: 'watchdog' library not installed.{RESET}")
@@ -112,8 +118,12 @@ def start_watch(source: Path | str, destination: Path | str | None = None, verbo
     source_p = Path(source).resolve()
     dest_p = Path(destination).resolve() if destination else source_p
 
-    # Validate before starting
-    org = FileOrganizer(source=source_p, destination=dest_p, verbose=verbose)
+    # Validate before starting — pass custom config if provided
+    try:
+        org = FileOrganizer(source=source_p, destination=dest_p, verbose=verbose, config_path=config_path)
+    except FileOrganizerError as exc:
+        print(f"{RED}Error: {exc}{RESET}")
+        raise SystemExit(1)
     try:
         org.validate()
     except FileOrganizerError as exc:
@@ -124,6 +134,8 @@ def start_watch(source: Path | str, destination: Path | str | None = None, verbo
     print(f"\n{BOLD}{CYAN}👀 Watchdog daemon started{RESET}")
     print(f"{DIM}   Watching   : {source_p}{RESET}")
     print(f"{DIM}   Destination: {dest_p}{RESET}")
+    if config_path:
+        print(f"{DIM}   Config      : {Path(config_path).resolve()}{RESET}")
     print(f"{DIM}   Press Ctrl+C to stop.{RESET}")
     print(f"{GRAY}{'─' * 60}{RESET}")
 

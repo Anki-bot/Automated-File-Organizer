@@ -4,6 +4,7 @@ core.py — Core FileOrganizer class.
 Responsibilities:
 - Scanning source directory (non-recursive, files only at top level)
 - Mapping files to categories via config (with universal fallback)
+- Custom JSON configuration override (completely replaces defaults)
 - Cryptographic deduplication (SHA-256) before moving
 - Dry-run preview
 - Safe moving with auto-rename on collision
@@ -25,7 +26,13 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from .config import CATEGORY_FOLDERS, HISTORY_FILENAME, get_category_for_path
+from .config import (
+    CATEGORY_FOLDERS,
+    EXTENSION_MAP,
+    FALLBACK_CATEGORY,
+    HISTORY_FILENAME,
+    load_custom_config,
+)
 
 # ANSI color codes (standard, no external deps)
 RESET = "\033[0m"
@@ -56,6 +63,9 @@ class FileOrganizer:
                      Defaults to source if not provided.
         dry_run: If True, only preview actions without moving files.
         logger: Standard library logger instance.
+        extension_map: Mapping ext -> category (custom or default)
+        category_folders: Set of category names
+        fallback_category: Fallback for unknown extensions
     """
 
     def __init__(
@@ -64,11 +74,13 @@ class FileOrganizer:
         destination: Path | str | None = None,
         dry_run: bool = False,
         verbose: bool = False,
+        config_path: Path | str | None = None,
     ) -> None:
         self.source = Path(source).resolve()
         self.destination = Path(destination).resolve() if destination else self.source
         self.dry_run = dry_run
         self.verbose = verbose
+        self.config_path = Path(config_path).resolve() if config_path else None
 
         self.logger = self._setup_logger(verbose)
 
@@ -81,6 +93,81 @@ class FileOrganizer:
         self._history: Dict[str, str] = {}
         # Deduplication counter
         self._duplicates: int = 0
+
+        # Configuration handling — custom JSON completely replaces defaults
+        # If a custom config is provided, we MUST clear all default mappings
+        # and strictly use ONLY the dictionary from the JSON.
+        if self.config_path:
+            # Initialize empty to ensure no default leakage before loading
+            self.extension_map: Dict[str, str] = {}
+            self.category_folders: set[str] = set()
+            self.fallback_category: str = FALLBACK_CATEGORY
+            self._load_custom_config()
+        else:
+            # Use defaults (copy to avoid mutating global)
+            self.extension_map: Dict[str, str] = dict(EXTENSION_MAP)
+            self.category_folders: set[str] = set(CATEGORY_FOLDERS)
+            self.fallback_category: str = FALLBACK_CATEGORY
+            if self.verbose:
+                self.logger.debug("Using default configuration")
+
+    # ------------------------------------------------------------------ #
+    # Configuration
+    # ------------------------------------------------------------------ #
+    def _load_custom_config(self) -> None:
+        """Load custom JSON config, sanitize, completely replace defaults, emit colored messages."""
+        assert self.config_path is not None
+        print(f"{DIM}  ↳ Loading custom config: {self.config_path}{RESET}")
+        try:
+            ext_map, cat_folders = load_custom_config(self.config_path)
+        except FileNotFoundError as exc:
+            raise FileOrganizerError(f"Config file not found: {exc}") from exc
+        except ValueError as exc:
+            raise FileOrganizerError(f"Config error: {exc}") from exc
+        except OSError as exc:
+            raise FileOrganizerError(f"Cannot read config file: {exc}") from exc
+
+        # CRITICAL: Clear any defaults and strictly use ONLY the JSON dictionary.
+        # Do not merge with EXTENSION_MAP or CATEGORY_FOLDERS.
+        self.extension_map.clear()
+        self.category_folders.clear()
+        self.extension_map = ext_map
+        # Strictly use categories from JSON, plus universal fallback for unknowns
+        # (fallback is required by spec but not considered a "default merge")
+        self.category_folders = set(cat_folders) | {FALLBACK_CATEGORY}
+        self.fallback_category = FALLBACK_CATEGORY
+
+        # Emit sanitization warnings with colors
+        warnings = getattr(load_custom_config, "warnings", [])
+        sanitized_count = sum(1 for w in warnings if w.startswith("Sanitized"))
+        if sanitized_count:
+            for w in warnings:
+                if w.startswith("Sanitized"):
+                    print(f"{YELLOW}  ⚠  {w}{RESET}")
+        # Other warnings (invalid, remapped)
+        for w in warnings:
+            if not w.startswith("Sanitized"):
+                print(f"{YELLOW}  ⚠  {w}{RESET}")
+
+        print(f"{GREEN}  ✔ Custom config loaded: {len(self.extension_map)} extensions → {len(self.category_folders)} categories{RESET}")
+        if self.verbose:
+            for cat in sorted(self.category_folders):
+                exts = sorted([e for e, c in self.extension_map.items() if c == cat])
+                if exts:
+                    print(f"{DIM}     • {cat}: {', '.join(exts)}{RESET}")
+
+    def _get_category(self, extension: str) -> str:
+        """Resolve category using instance mapping with universal fallback."""
+        if not extension:
+            return self.fallback_category
+        ext = extension.lower()
+        if not ext.startswith("."):
+            ext = f".{ext}"
+        return self.extension_map.get(ext, self.fallback_category)
+
+    def _get_category_for_path(self, file_path: Path) -> str:
+        """Wrapper that extracts suffix and resolves via instance mapping."""
+        return self._get_category(file_path.suffix)
 
     # ------------------------------------------------------------------ #
     # Logger
@@ -186,8 +273,8 @@ class FileOrganizer:
                 self._skipped += 1
                 continue
 
-            # Universal fallback handled inside get_category_for_path
-            category = get_category_for_path(entry)
+            # Universal fallback handled inside _get_category_for_path (uses custom map if provided)
+            category = self._get_category_for_path(entry)
             self._file_map[entry] = category
 
         return self._file_map
@@ -320,7 +407,7 @@ class FileOrganizer:
             # If file is inside destination/category folder, ignore (already organized)
             if self.destination in src.parents:
                 rel = src.relative_to(self.destination)
-                if rel.parts and rel.parts[0] in CATEGORY_FOLDERS:
+                if rel.parts and rel.parts[0] in self.category_folders:
                     if self.verbose:
                         self.logger.debug(f"Skipping already-organized file: {src}")
                     return "skipped"
@@ -340,7 +427,7 @@ class FileOrganizer:
         if not src.exists():
             return "skipped"
 
-        category = get_category_for_path(src)
+        category = self._get_category_for_path(src)
         dest_folder = self.destination / category
 
         try:
@@ -399,14 +486,9 @@ class FileOrganizer:
         # --- MOVE ---
         try:
             original = str(src.resolve())
-            # Re-check resolved target hasn't become duplicate during wait
-            # (rare but safe)
             shutil.move(str(src), str(target))
             self._results[category] += 1
             self._history[str(target.resolve())] = original
-            # Save history incrementally for watchdog (so each file is logged)
-            # We do batch save at end for organize(), but for single file we save immediately
-            # To avoid excessive I/O, we merge and write
             self._save_history()
             renamed = target.name != Path(original).name
             self._print_move(src, target, category, renamed=renamed)
@@ -470,6 +552,7 @@ class FileOrganizer:
                     f"Permission denied creating destination: {exc}"
                 ) from exc
 
+
         for category in sorted(grouped):
             files = grouped[category]
             dest_folder = self.destination / category
@@ -484,9 +567,6 @@ class FileOrganizer:
                     continue
 
             for src in files:
-                # Delegate to single-file logic for deduplication consistency
-                # But for batch we want to avoid re-resolving category/counter double-increment issues
-                # So we inline deduplication + move here to preserve grouping + summary logic
                 target = dest_folder / src.name
 
                 if not self.dry_run:
@@ -581,7 +661,6 @@ class FileOrganizer:
         elif alt.exists():
             history_file = alt
         else:
-            # Also check if source==destination, already covered; just warn
             expected = hp
             print(f"\n{YELLOW}⚠  Nothing to undo — no history file found.{RESET}")
             print(f"{DIM}   Expected: {expected}{RESET}")
@@ -602,14 +681,12 @@ class FileOrganizer:
         if not isinstance(raw, dict) or not raw:
             print(f"\n{YELLOW}⚠  History file is empty — nothing to undo.{RESET}")
             print(f"{DIM}   File: {history_file}{RESET}\n")
-            # Clean up empty file
             try:
                 history_file.unlink()
             except OSError:
                 pass
             return 0
 
-        # Normalize to Path objects: new_path -> original_path
         entries: List[Tuple[Path, Path]] = []
         for new_s, orig_s in raw.items():
             entries.append((Path(new_s), Path(orig_s)))
@@ -621,13 +698,10 @@ class FileOrganizer:
 
         restored = 0
         errors: List[Tuple[Path, str]] = []
-        # Track categories that might become empty
         touched_categories: set[str] = set()
 
         for new_path, orig_path in sorted(entries, key=lambda x: x[0].name):
-            # Record category for cleanup
             try:
-                # Category is parent folder name of new_path
                 touched_categories.add(new_path.parent.name)
             except Exception:
                 pass
@@ -638,7 +712,6 @@ class FileOrganizer:
                 errors.append((new_path, msg))
                 continue
 
-            # Ensure original parent exists
             try:
                 orig_path.parent.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
@@ -646,7 +719,6 @@ class FileOrganizer:
                 errors.append((new_path, str(exc)))
                 continue
 
-            # Resolve collision if something now occupies original path
             restore_target = orig_path
             if restore_target.exists():
                 restore_target = self._resolve_collision(restore_target)
@@ -665,18 +737,23 @@ class FileOrganizer:
                 errors.append((new_path, str(exc)))
                 print(f"  {RED}✘{RESET} {new_path.name} {RED}— {exc}{RESET}")
 
-        # Clean up empty category folders in destination
+        # Clean up empty category folders — strictly use custom categories if provided,
+        # plus touched. Do not merge with global CATEGORY_FOLDERS when custom config is active.
         cleaned: List[str] = []
-        # Check both touched categories and all known categories
-        candidates = touched_categories | CATEGORY_FOLDERS
+        if self.config_path:
+            candidates = touched_categories | self.category_folders
+        else:
+            candidates = touched_categories | self.category_folders | CATEGORY_FOLDERS
         for cat in sorted(candidates):
             folder = self.destination / cat
-            # Only delete if it's a known category or was touched, exists, and is empty
             if folder.exists() and folder.is_dir():
-                # Only auto-delete if it's a category folder we manage
-                if cat in CATEGORY_FOLDERS or cat in touched_categories:
+                # Only clean folders that belong to the active configuration
+                if self.config_path:
+                    should_clean = cat in self.category_folders or cat in touched_categories
+                else:
+                    should_clean = cat in self.category_folders or cat in CATEGORY_FOLDERS or cat in touched_categories
+                if should_clean:
                     try:
-                        # Check if empty (no files/dirs inside, ignoring hidden files?)
                         if not any(folder.iterdir()):
                             folder.rmdir()
                             cleaned.append(cat)
@@ -685,7 +762,6 @@ class FileOrganizer:
                         if self.verbose:
                             self.logger.debug(f"Could not remove {folder}: {exc}")
 
-        # Delete history file
         try:
             history_file.unlink()
             print(f"{DIM}  🗑  Deleted history file: {history_file.name}{RESET}")
@@ -693,7 +769,6 @@ class FileOrganizer:
             print(f"{RED}✘ Could not delete history file {history_file}: {exc}{RESET}")
             errors.append((history_file, str(exc)))
 
-        # Summary
         print(f"\n{GRAY}{'─' * 60}{RESET}")
         if restored:
             print(f"{BOLD}{GREEN} Undo complete — {restored} file(s) restored{RESET}")
@@ -716,12 +791,16 @@ class FileOrganizer:
         print(f"\n{BOLD}{CYAN}📁 Organizing files{RESET}")
         print(f"{DIM}   Source      : {self.source}{RESET}")
         print(f"{DIM}   Destination : {self.destination}{RESET}")
+        if self.config_path:
+            print(f"{DIM}   Config      : {self.config_path}{RESET}")
         print(f"{GRAY}{'─' * 60}{RESET}")
 
     def _print_dry_run_header(self) -> None:
         print(f"\n{BOLD}{YELLOW}🔍 DRY RUN — Preview only, no files will be moved{RESET}")
         print(f"{DIM}   Source      : {self.source}{RESET}")
         print(f"{DIM}   Destination : {self.destination}{RESET}")
+        if self.config_path:
+            print(f"{DIM}   Config      : {self.config_path}{RESET}")
         print(f"{GRAY}{'─' * 60}{RESET}")
 
     def _print_no_files(self) -> None:
@@ -767,7 +846,6 @@ class FileOrganizer:
             print(f"{DIM}  Nothing to do.{RESET}")
             return
 
-        # Calculate column widths for table
         if self._results:
             cat_width = max(len(c) for c in self._results) + 2
         else:
@@ -779,7 +857,6 @@ class FileOrganizer:
             count_width = len("Files")
         count_width = max(count_width, len("Files"))
 
-        # Header
         if self._results:
             header = f"  {BOLD}{'Category'.ljust(cat_width)}{'Files'.rjust(count_width)}   Status{RESET}"
             print(header)
@@ -823,7 +900,8 @@ class FileOrganizer:
         destination: Path | str | None = None,
         dry_run: bool = False,
         verbose: bool = False,
+        config_path: Path | str | None = None,
     ) -> Counter:
         """One-liner to scan + organize."""
-        inst = cls(source=source, destination=destination, dry_run=dry_run, verbose=verbose)
+        inst = cls(source=source, destination=destination, dry_run=dry_run, verbose=verbose, config_path=config_path)
         return inst.organize()
